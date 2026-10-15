@@ -344,6 +344,10 @@ private:
                     ESP_LOGI(TAG, "Shake detected, waking XiaoZhi");
                     app.WakeWordInvoke("小智刚刚被用户摇晃唤醒了");
                 }
+                if (decision.toppled) {
+                    ESP_LOGI(TAG, "Topple detected, waking XiaoZhi");
+                    app.WakeWordInvoke("小智被推倒了");
+                }
             } else if (++failed_reads % 20 == 1) {
                 ESP_LOGW(TAG, "QMI8658 read failed: %s", esp_err_to_name(err));
             }
