@@ -8,14 +8,17 @@
 #include "i2c_device.h"
 #include "esp32_camera.h"
 #include "mcp_server.h"
+#include "motion_detector.h"
 #include "press_to_talk_mcp_tool.h"
 
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <esp_lcd_touch_ft5x06.h>
 #include <esp_lvgl_port.h>
+#include <freertos/task.h>
 #include <lvgl.h>
 
 #define TAG "LichuangDevBoard"
@@ -63,6 +66,7 @@ class LichuangDevBoard : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     i2c_master_dev_handle_t pca9557_handle_;
+    i2c_master_dev_handle_t imu_device_ = nullptr;
     Button boot_button_;
     Display* display_;
     Pca9557* pca9557_;
@@ -229,6 +233,124 @@ private:
         }
     }
 
+    esp_err_t WriteImuReg(uint8_t reg, uint8_t value) {
+        uint8_t data[] = {reg, value};
+        return i2c_master_transmit(imu_device_, data, sizeof(data), 100);
+    }
+
+    void InitializeMotionSensor() {
+        i2c_device_config_t imu_config = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = 0x6a,
+            .scl_speed_hz = 100000,
+        };
+        esp_err_t err = i2c_master_bus_add_device(i2c_bus_, &imu_config, &imu_device_);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "QMI8658 unavailable: %s", esp_err_to_name(err));
+            return;
+        }
+
+        uint8_t reg = 0x00;
+        uint8_t id = 0;
+        err = i2c_master_transmit_receive(imu_device_, &reg, 1, &id, 1, 100);
+        if (err != ESP_OK || id != 0x05) {
+            ESP_LOGW(TAG, "QMI8658 not found (err=%s, id=0x%02x)", esp_err_to_name(err), id);
+            i2c_master_bus_rm_device(imu_device_);
+            imu_device_ = nullptr;
+            return;
+        }
+
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            err = WriteImuReg(0x60, 0xb0);
+            if (err != ESP_OK)
+                continue;
+            vTaskDelay(pdMS_TO_TICKS(30));
+            err = WriteImuReg(0x02, 0x40);  // Auto-increment
+            if (err == ESP_OK)
+                err = WriteImuReg(0x03, 0x15);  // Accel: 4g, 250 Hz; self-test off
+            if (err == ESP_OK)
+                err = WriteImuReg(0x08, 0x01);  // Enable accel only
+            if (err != ESP_OK)
+                continue;
+
+            uint8_t status_reg = 0x2e;
+            uint8_t status = 0;
+            for (int poll = 0; poll < 10; ++poll) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                err = i2c_master_transmit_receive(imu_device_, &status_reg, 1, &status, 1, 100);
+                if (err != ESP_OK || (status & 1))
+                    break;
+            }
+            if (err == ESP_OK && (status & 1))
+                break;
+            if (err == ESP_OK)
+                err = ESP_ERR_TIMEOUT;
+        }
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "QMI8658 did not start sampling: %s", esp_err_to_name(err));
+            i2c_master_bus_rm_device(imu_device_);
+            imu_device_ = nullptr;
+            return;
+        }
+
+        if (xTaskCreate(MotionTask, "motion", 4096, this, 4, nullptr) != pdPASS) {
+            ESP_LOGW(TAG, "Failed to start motion task");
+            i2c_master_bus_rm_device(imu_device_);
+            imu_device_ = nullptr;
+            return;
+        }
+        ESP_LOGI(TAG, "QMI8658 motion controls ready");
+    }
+
+    static void MotionTask(void* arg) {
+        auto* board = static_cast<LichuangDevBoard*>(arg);
+        MotionDetector detector(MotionDetector::ScreenUpAxis::X, true);
+        unsigned failed_reads = 0;
+        while (true) {
+            uint8_t status_reg = 0x2e;
+            uint8_t status = 0;
+            esp_err_t err =
+                i2c_master_transmit_receive(board->imu_device_, &status_reg, 1, &status, 1, 100);
+            if (err == ESP_OK && (status & 1) == 0) {
+                vTaskDelay(pdMS_TO_TICKS(80));
+                continue;
+            }
+            uint8_t reg = 0x35;
+            uint8_t raw[6] = {};
+            if (err == ESP_OK) {
+                err =
+                    i2c_master_transmit_receive(board->imu_device_, &reg, 1, raw, sizeof(raw), 100);
+            }
+            if (err == ESP_OK) {
+                failed_reads = 0;
+                int16_t ax = static_cast<int16_t>(raw[0] | (raw[1] << 8));
+                int16_t ay = static_cast<int16_t>(raw[2] | (raw[3] << 8));
+                int16_t az = static_cast<int16_t>(raw[4] | (raw[5] << 8));
+                auto& app = Application::GetInstance();
+                uint32_t now_ms = esp_timer_get_time() / 1000;
+                auto decision =
+                    detector.Update(ax, ay, az, now_ms, app.GetDeviceState() == kDeviceStateIdle);
+                if (decision.rotation_changed && lvgl_port_lock(100)) {
+                    lv_display_t* display = lv_display_get_default();
+                    if (display != nullptr) {
+                        lv_display_set_rotation(display, decision.inverted ? LV_DISPLAY_ROTATION_180
+                                                                           : LV_DISPLAY_ROTATION_0);
+                        ESP_LOGI(TAG, "Screen %s (accel=%d,%d,%d)",
+                                 decision.inverted ? "inverted" : "normal", ax, ay, az);
+                    }
+                    lvgl_port_unlock();
+                }
+                if (decision.shake) {
+                    ESP_LOGI(TAG, "Shake detected, waking XiaoZhi");
+                    app.WakeWordInvoke("小智刚刚被用户摇晃唤醒了");
+                }
+            } else if (++failed_reads % 20 == 1) {
+                ESP_LOGW(TAG, "QMI8658 read failed: %s", esp_err_to_name(err));
+            }
+            vTaskDelay(pdMS_TO_TICKS(80));
+        }
+    }
+
     void InitializeCamera() {
         // Open camera power
         pca9557_->SetOutputState(2, 0);
@@ -288,6 +410,7 @@ public:
         InitializeButtons();
         InitializeCamera();
         InitializeTools();
+        InitializeMotionSensor();
 
         GetBacklight()->RestoreBrightness();
     }
