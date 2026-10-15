@@ -1,25 +1,31 @@
-#include "wifi_board.h"
-#include "codecs/box_audio_codec.h"
-#include "display/lcd_display.h"
-#include "display/emote_display.h"
 #include "application.h"
 #include "button.h"
+#include "codecs/box_audio_codec.h"
 #include "config.h"
-#include "i2c_device.h"
+#include "display/emote_display.h"
+#include "display/lcd_display.h"
 #include "esp32_camera.h"
+#include "i2c_device.h"
 #include "mcp_server.h"
 #include "motion_detector.h"
 #include "press_to_talk_mcp_tool.h"
+#include "settings.h"
+#include "wifi_board.h"
 
-#include <esp_log.h>
-#include <esp_timer.h>
-#include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
+#include <driver/sdmmc_host.h>
 #include <driver/spi_common.h>
+#include <esp_lcd_panel_vendor.h>
 #include <esp_lcd_touch_ft5x06.h>
+#include <esp_log.h>
 #include <esp_lvgl_port.h>
+#include <esp_timer.h>
+#include <esp_vfs_fat.h>
 #include <freertos/task.h>
 #include <lvgl.h>
+#include <sdmmc_cmd.h>
+#include <atomic>
+#include <mutex>
 
 #define TAG "LichuangDevBoard"
 
@@ -72,6 +78,12 @@ private:
     Pca9557* pca9557_;
     Esp32Camera* camera_;
     PressToTalkMcpTool* press_to_talk_tool_ = nullptr;
+    std::atomic<bool> wake_shake_enabled_{true};
+    std::atomic<bool> wake_topple_enabled_{true};
+    std::atomic<MotionPose> pose_{MotionPose::Unknown};
+    std::atomic<uint32_t> pose_sample_ms_{0};
+    std::mutex sd_mutex_;
+    sdmmc_card_t* sd_card_ = nullptr;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -328,8 +340,11 @@ private:
                 int16_t az = static_cast<int16_t>(raw[4] | (raw[5] << 8));
                 auto& app = Application::GetInstance();
                 uint32_t now_ms = esp_timer_get_time() / 1000;
-                auto decision =
-                    detector.Update(ax, ay, az, now_ms, app.GetDeviceState() == kDeviceStateIdle);
+                auto decision = detector.Update(
+                    ax, ay, az, now_ms, app.GetDeviceState() == kDeviceStateIdle,
+                    board->wake_shake_enabled_.load(), board->wake_topple_enabled_.load());
+                board->pose_.store(decision.pose);
+                board->pose_sample_ms_.store(now_ms);
                 if (decision.rotation_changed && lvgl_port_lock(100)) {
                     lv_display_t* display = lv_display_get_default();
                     if (display != nullptr) {
@@ -391,7 +406,119 @@ private:
     }
 
     void InitializeTools() {
-        auto &mcp_server = McpServer::GetInstance();
+        auto& mcp_server = McpServer::GetInstance();
+        Settings motion_settings("motion");
+        wake_shake_enabled_.store(motion_settings.GetBool("shake", true));
+        wake_topple_enabled_.store(motion_settings.GetBool("topple", true));
+
+        mcp_server.AddTool(
+            "self.motion.get_pose",
+            "Get the board's current physical pose from its accelerometer: upright, inverted, "
+            "face_up, face_down, or moving_or_tilted. Also reports current gesture wake settings.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                const uint32_t sample_ms = pose_sample_ms_.load();
+                const uint32_t age_ms = esp_timer_get_time() / 1000 - sample_ms;
+                const bool available = sample_ms != 0 && age_ms <= 1000;
+                const char* pose = "unknown";
+                if (available) {
+                    switch (pose_.load()) {
+                        case MotionPose::Upright:
+                            pose = "upright";
+                            break;
+                        case MotionPose::Inverted:
+                            pose = "inverted";
+                            break;
+                        case MotionPose::FaceUp:
+                            pose = "face_up";
+                            break;
+                        case MotionPose::FaceDown:
+                            pose = "face_down";
+                            break;
+                        case MotionPose::MovingOrTilted:
+                            pose = "moving_or_tilted";
+                            break;
+                        default:
+                            break;
+                    }
+                }
+                cJSON* result = cJSON_CreateObject();
+                cJSON_AddBoolToObject(result, "available", available);
+                cJSON_AddStringToObject(result, "pose", pose);
+                cJSON_AddBoolToObject(result, "shake_wake_enabled", wake_shake_enabled_.load());
+                cJSON_AddBoolToObject(result, "topple_wake_enabled", wake_topple_enabled_.load());
+                if (available)
+                    cJSON_AddNumberToObject(result, "sample_age_ms", age_ms);
+                return result;
+            });
+
+        mcp_server.AddTool(
+            "self.motion.set_wake_gestures",
+            "Enable or disable shake and topple-to-flat wake gestures independently. "
+            "Both arguments are required. To change only one gesture, first call "
+            "self.motion.get_pose and preserve the other setting. Settings survive reboot; "
+            "screen rotation remains automatic.",
+            PropertyList({Property("shake", kPropertyTypeBoolean),
+                          Property("topple", kPropertyTypeBoolean)}),
+            [this](const PropertyList& properties) -> ReturnValue {
+                const bool shake = properties["shake"].value<bool>();
+                const bool topple = properties["topple"].value<bool>();
+                {
+                    Settings settings("motion", true);
+                    settings.SetBool("shake", shake);
+                    settings.SetBool("topple", topple);
+                }
+                wake_shake_enabled_.store(shake);
+                wake_topple_enabled_.store(topple);
+                cJSON* result = cJSON_CreateObject();
+                cJSON_AddBoolToObject(result, "shake", shake);
+                cJSON_AddBoolToObject(result, "topple", topple);
+                return result;
+            });
+
+        mcp_server.AddTool(
+            "self.storage.get_status",
+            "Check the board's microSD card and report FAT filesystem total and free space. "
+            "An unavailable card is reported without formatting it.",
+            PropertyList(), [this](const PropertyList&) -> ReturnValue {
+                std::lock_guard<std::mutex> lock(sd_mutex_);
+                esp_err_t err = ESP_OK;
+                if (sd_card_ == nullptr) {
+                    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+                    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
+                    slot.width = 1;
+                    slot.clk = GPIO_NUM_47;
+                    slot.cmd = GPIO_NUM_48;
+                    slot.d0 = GPIO_NUM_21;
+                    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+                    esp_vfs_fat_mount_config_t mount = {};
+                    mount.format_if_mount_failed = false;
+                    mount.max_files = 2;
+                    err = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot, &mount, &sd_card_);
+                } else {
+                    err = sdmmc_get_status(sd_card_);
+                }
+
+                uint64_t total_bytes = 0;
+                uint64_t free_bytes = 0;
+                if (err == ESP_OK) {
+                    err = esp_vfs_fat_info("/sdcard", &total_bytes, &free_bytes);
+                }
+                if (err != ESP_OK && sd_card_ != nullptr) {
+                    esp_vfs_fat_sdcard_unmount("/sdcard", sd_card_);
+                    sd_card_ = nullptr;
+                }
+
+                cJSON* result = cJSON_CreateObject();
+                cJSON_AddBoolToObject(result, "mounted", err == ESP_OK);
+                if (err == ESP_OK) {
+                    cJSON_AddNumberToObject(result, "total_bytes", total_bytes);
+                    cJSON_AddNumberToObject(result, "free_bytes", free_bytes);
+                } else {
+                    cJSON_AddStringToObject(result, "error", esp_err_to_name(err));
+                }
+                return result;
+            });
+
         mcp_server.AddTool("self.system.reconfigure_wifi",
             "End this conversation and enter WiFi configuration mode.\n"
             "**CAUTION** You must ask the user to confirm this action.",

@@ -56,4 +56,23 @@ int main() {
     stale_topple.Update(0, 8192, 0, 3000, true);
     stale_topple.Update(0, 0, 8192, 3080, true);
     assert(!stale_topple.Update(0, 0, 8192, 3480, true).toppled);
+
+    MotionDetector configurable(MotionDetector::ScreenUpAxis::X, true);
+    assert(configurable.Update(8192, 0, 0, 0, true, false, false).pose == MotionPose::Upright);
+    assert(configurable.Update(-8192, 0, 0, 80, true, false, false).pose == MotionPose::Inverted);
+    assert(configurable.Update(0, 0, 8192, 160, true, false, false).pose == MotionPose::FaceUp);
+    assert(configurable.Update(0, 0, -8192, 240, true, false, false).pose == MotionPose::FaceDown);
+    assert(configurable.Update(0, 8192, 0, 320, true, false, false).pose ==
+           MotionPose::MovingOrTilted);
+    assert(!configurable.Update(15000, 0, 0, 400, true, false, false).shake);
+    configurable.Update(8192, 0, 0, 480, true, false, false);
+    assert(!configurable.Update(-15000, 0, 0, 560, true, false, false).shake);
+    configurable.Update(8192, 0, 0, 640, true, false, false);
+    configurable.Update(8192, 0, 0, 1120, true, false, false);
+    configurable.Update(0, 0, 8192, 1200, true, false, false);
+    assert(!configurable.Update(0, 0, 8192, 1600, true, false, false).toppled);
+    configurable.Update(8192, 0, 0, 1680, true, true, true);
+    configurable.Update(8192, 0, 0, 2160, true, true, true);
+    configurable.Update(0, 0, -8192, 2240, true, true, true);
+    assert(configurable.Update(0, 0, -8192, 2640, true, true, true).toppled);
 }

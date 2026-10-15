@@ -3,11 +3,14 @@
 
 #include <cstdint>
 
+enum class MotionPose { Unknown, Upright, Inverted, FaceUp, FaceDown, MovingOrTilted };
+
 struct MotionDecision {
     bool rotation_changed = false;
     bool inverted = false;
     bool shake = false;
     bool toppled = false;
+    MotionPose pose = MotionPose::Unknown;
 };
 
 class MotionDetector {
@@ -17,7 +20,8 @@ public:
     MotionDetector(ScreenUpAxis axis, bool normal_positive)
         : axis_(axis), normal_positive_(normal_positive) {}
 
-    MotionDecision Update(int16_t ax, int16_t ay, int16_t az, uint32_t now_ms, bool allow_wake) {
+    MotionDecision Update(int16_t ax, int16_t ay, int16_t az, uint32_t now_ms, bool allow_wake,
+                          bool allow_shake = true, bool allow_topple = true) {
         MotionDecision decision;
         const int32_t up = axis_ == ScreenUpAxis::X ? ax : ay;
         const int32_t side = axis_ == ScreenUpAxis::X ? ay : ax;
@@ -32,6 +36,10 @@ public:
             gravity && abs_up >= 5500 && abs_up * 4 >= abs_side * 5 && abs_up * 4 >= abs_z * 5;
         const bool flat =
             gravity && abs_z >= 6000 && abs_z * 4 >= abs_up * 5 && abs_z * 4 >= abs_side * 5;
+        decision.pose =
+            upright ? ((up > 0) == normal_positive_ ? MotionPose::Upright : MotionPose::Inverted)
+            : flat  ? (az > 0 ? MotionPose::FaceUp : MotionPose::FaceDown)
+                    : MotionPose::MovingOrTilted;
 
         // Hold the last orientation while flat, moving, or near a side edge.
         if (upright) {
@@ -52,7 +60,11 @@ public:
         }
         decision.inverted = inverted_;
 
-        if (upright) {
+        if (!allow_topple) {
+            upright_candidate_ = false;
+            topple_armed_ = false;
+            flat_candidate_ = false;
+        } else if (upright) {
             if (!upright_candidate_) {
                 upright_candidate_ = true;
                 upright_since_ms_ = now_ms;
@@ -82,7 +94,7 @@ public:
         }
 
         const bool impulse = magnitude_squared >= int64_t(13000) * 13000;
-        if (!allow_wake) {
+        if (!allow_wake || !allow_shake) {
             impulse_count_ = 0;
         } else if (impulse && !was_impulse_) {
             if (impulse_count_ == 0 || now_ms - last_impulse_ms_ > 700) {
